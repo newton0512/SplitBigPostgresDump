@@ -15,7 +15,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-from constants import OUTPUT_DIR, RESTORE_STATE_FILENAME
+from constants import (
+    OUTPUT_DIR,
+    PG_DATABASE,
+    PG_HOST,
+    PG_PORT,
+    PG_USER,
+    RESTORE_STATE_FILENAME,
+)
 
 # Chunk name patterns in execution order
 PREAMBLE_GLOB = "01_preamble.sql"
@@ -172,14 +179,18 @@ def sorted_data_chunks(chunks_dir: Path) -> list[Path]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Restore DB from split dump chunks (idempotent, with row resume).")
-    ap.add_argument("chunks_dir", nargs="?", default=OUTPUT_DIR, help="Directory with 01_*.sql, 02_*.sql, ...")
-    ap.add_argument("--psql", default="psql", help="Path to psql (default: psql)")
-    ap.add_argument("--db", "-d", help="Database name (or set PGDATABASE)")
-    ap.add_argument("--host", "-h", help="Host (or set PGHOST)")
-    ap.add_argument("--port", "-p", help="Port (or set PGPORT)")
-    ap.add_argument("--user", "-U", help="User (or set PGUSER)")
-    ap.add_argument("--reset", action="store_true", help="Reset restore state and start from scratch (still runs chunks in order)")
+    ap = argparse.ArgumentParser(
+        description="Restore DB from split dump chunks (idempotent, with row resume). "
+        "Target schema is taken from the dump (e.g. public); set connection via CLI, constants.py, or PGHOST/PGPORT/PGUSER/PGDATABASE. "
+        "Password: PGPASSWORD or .pgpass.",
+    )
+    ap.add_argument("chunks_dir", nargs="?", default=OUTPUT_DIR, help="Каталог с чанками 01_*.sql, 02_*.sql, ...")
+    ap.add_argument("--psql", default="psql", help="Путь к psql")
+    ap.add_argument("--db", "-d", default=PG_DATABASE, help="База данных (по умолчанию: constants.PG_DATABASE или PGDATABASE)")
+    ap.add_argument("--host", "-h", default=PG_HOST, help="Хост PostgreSQL (по умолчанию: constants.PG_HOST или PGHOST)")
+    ap.add_argument("--port", "-p", default=PG_PORT, help="Порт (по умолчанию: constants.PG_PORT или PGPORT)")
+    ap.add_argument("--user", "-U", default=PG_USER, help="Пользователь (по умолчанию: constants.PG_USER или PGUSER)")
+    ap.add_argument("--reset", action="store_true", help="Сбросить состояние восстановления и начать с начала")
     args = ap.parse_args()
 
     chunks_dir = Path(args.chunks_dir)
@@ -201,14 +212,22 @@ def main() -> None:
         state["data_files"] = {}
 
     psql_cmd = [args.psql]
-    if args.db:
-        psql_cmd.extend(["-d", args.db])
-    if args.host:
-        psql_cmd.extend(["-h", args.host])
-    if args.port:
-        psql_cmd.extend(["-p", args.port])
-    if args.user:
-        psql_cmd.extend(["-U", args.user])
+    if args.db is not None:
+        psql_cmd.extend(["-d", str(args.db)])
+    if args.host is not None:
+        psql_cmd.extend(["-h", str(args.host)])
+    if args.port is not None:
+        psql_cmd.extend(["-p", str(args.port)])
+    if args.user is not None:
+        psql_cmd.extend(["-U", str(args.user)])
+
+    logger.info(
+        "Restore target: db=%s host=%s port=%s user=%s (schema from dump, e.g. public)",
+        args.db or "(PGDATABASE)",
+        args.host or "(PGHOST/localhost)",
+        args.port or "(PGPORT/5432)",
+        args.user or "(PGUSER)",
+    )
 
     # 01_preamble (skip if already done on resume)
     if not state.get("preamble_done"):

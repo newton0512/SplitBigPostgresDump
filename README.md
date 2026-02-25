@@ -17,6 +17,7 @@
 - `DUMP_FILENAME` — имя файла дампа (например `dump-anon-db-test-20250905.sql`).
 - `MAX_DATA_CHUNK_BYTES` — максимальный размер одного файла с данными (по умолчанию 3 ГБ).
 - `READ_BLOCK_BYTES` — размер блока при потоковом чтении дампа (по умолчанию 256 МБ).
+- Восстановление: `PG_HOST`, `PG_PORT`, `PG_USER`, `PG_DATABASE` — параметры подключения к PostgreSQL (если не заданы, используются переменные окружения или аргументы CLI). **Схема не настраивается** — объекты восстанавливаются в те же схемы, что и в дампе (например `public`).
 
 ## Структура чанков (в OUTPUT_DIR)
 
@@ -47,6 +48,8 @@ python3 split_dump.py
 - Логи: `OUTPUT_DIR/split_dump.log` и вывод в stdout.
 
 ### 2. Восстановление из чанков
+
+Подключение к PostgreSQL задаётся через `constants.py` (`PG_HOST`, `PG_PORT`, `PG_USER`, `PG_DATABASE`), аргументы CLI или переменные окружения `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`. Пароль — `PGPASSWORD` или `~/.pgpass`. Восстановление идёт **в те же схемы, что в дампе** (например `public`), отдельно указать целевую схему нельзя.
 
 ```bash
 python3 restore.py [chunks_dir] [--db ИМЯ_БД] [--host ХОСТ] [--port ПОРТ] [--user ПОЛЬЗОВАТЕЛЬ] [--reset]

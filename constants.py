@@ -17,3 +17,10 @@ STATE_FILENAME = "state.json"
 RESTORE_STATE_FILENAME = "restore_state.json"
 SPLIT_LOG_FILENAME = "split_dump.log"
 VALIDATE_REPAIR_LOG_FILENAME = "validate_repair.log"
+
+# Restore: подключение к PostgreSQL (если None — используются переменные окружения PGHOST/PGPORT/PGUSER/PGDATABASE или аргументы CLI).
+# Схема не задаётся здесь: восстановление идёт в те же схемы, что и в дампе (например public).
+PG_HOST = None
+PG_PORT = None
+PG_USER = None
+PG_DATABASE = None
