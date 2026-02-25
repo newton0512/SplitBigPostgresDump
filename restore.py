@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""
+Idempotent restore of a database from split dump chunks.
+Runs 01_preamble, 02_schema_*, 03_data_* (with row-count resume), 04_indexes, 05_functions, 06_views_triggers.
+State in restore_state.json tracks rows loaded per data file so restore can resume.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+from constants import OUTPUT_DIR, RESTORE_STATE_FILENAME
+
+# Chunk name patterns in execution order
+PREAMBLE_GLOB = "01_preamble.sql"
+SCHEMA_GLOB = "02_schema_*.sql"
+DATA_GLOB = "03_data_*_part*.sql"
+DATA_META_SUFFIX = ".meta.json"
+INDEXES_GLOB = "04_indexes*.sql"
+FUNCTIONS_GLOB = "05_functions*.sql"
+VIEWS_TRIGGERS_GLOB = "06_views_triggers*.sql"
+
+COPY_FROM_STDIN_RE = re.compile(r"^\s*COPY\s+.+FROM\s+stdin\s*;?\s*$", re.IGNORECASE)
+OUTPUT_LINE_TERMINATOR = "\n"
+
+
+def setup_logging(chunks_dir: Path) -> logging.Logger:
+    logger = logging.getLogger("restore")
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    log_path = chunks_dir / "restore.log"
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    fh.setFormatter(fmt)
+    sh.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
+
+
+def load_restore_state(chunks_dir: Path) -> dict:
+    p = chunks_dir / RESTORE_STATE_FILENAME
+    if not p.exists():
+        return {"data_files": {}}
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_restore_state(chunks_dir: Path, state: dict, logger: logging.Logger) -> None:
+    p = chunks_dir / RESTORE_STATE_FILENAME
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    logger.debug("Restore state saved.")
+
+
+def run_psql_file(chunks_dir: Path, path: Path, psql_cmd: list[str], logger: logging.Logger) -> bool:
+    """Run psql -f path. Returns True on success."""
+    cmd = psql_cmd + ["-f", str(path)]
+    logger.info("Executing %s", path.name)
+    try:
+        r = subprocess.run(cmd, cwd=str(chunks_dir), capture_output=True, text=True, timeout=3600)
+        if r.returncode != 0:
+            logger.error("psql failed for %s: %s", path.name, r.stderr or r.stdout)
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        logger.error("psql timed out for %s", path.name)
+        return False
+    except Exception as e:
+        logger.exception("psql error for %s: %s", path.name, e)
+        return False
+
+
+def run_psql_copy_stdin(
+    chunks_dir: Path,
+    copy_header_line: str,
+    data_lines: list[str],
+    psql_cmd: list[str],
+    logger: logging.Logger,
+) -> bool:
+    """Run psql -c 'COPY ... FROM stdin' and feed data_lines + '\\.' to stdin."""
+    cmd = psql_cmd + ["-c", copy_header_line.rstrip()]
+    data = OUTPUT_LINE_TERMINATOR.join(data_lines) + OUTPUT_LINE_TERMINATOR + "\\." + OUTPUT_LINE_TERMINATOR
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(chunks_dir),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        out, err = proc.communicate(input=data, timeout=3600)
+        if proc.returncode != 0:
+            logger.error("COPY stdin failed: %s", err or out)
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        logger.error("COPY stdin timed out")
+        return False
+    except Exception as e:
+        logger.exception("COPY stdin error: %s", e)
+        return False
+
+
+def stream_copy_remaining(
+    data_path: Path,
+    meta: dict,
+    rows_loaded: int,
+    psql_cmd: list[str],
+    logger: logging.Logger,
+) -> tuple[bool, int]:
+    """
+    For a data chunk file: skip first line (COPY header) and rows_loaded data lines,
+    then run COPY ... FROM stdin with the remaining lines + '\\.'
+    Returns (success, total_rows_loaded_after_this_run).
+    """
+    total_rows = meta.get("rows", 0)
+    if rows_loaded >= total_rows:
+        logger.info("Skip %s (already loaded %s/%s rows)", data_path.name, rows_loaded, total_rows)
+        return True, rows_loaded
+
+    with open(data_path, "r", encoding="utf-8", newline="") as f:
+        copy_header_line = f.readline()
+        if not COPY_FROM_STDIN_RE.match(copy_header_line.strip()):
+            logger.error("%s: first line is not COPY ... FROM stdin", data_path.name)
+            return False, rows_loaded
+        for _ in range(rows_loaded):
+            line = f.readline()
+            if not line:
+                break
+            if line.rstrip("\r\n") == "\\.":
+                logger.warning("%s: hit \\. before expected; rows_loaded may be wrong", data_path.name)
+                return False, rows_loaded
+        remaining_lines: list[str] = []
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            norm = line.rstrip("\r\n")
+            if norm == "\\.":
+                break
+            remaining_lines.append(line.rstrip("\r\n"))
+        # remaining_lines now has only data rows (we consumed \\.)
+
+    if not remaining_lines and rows_loaded == total_rows:
+        return True, total_rows
+
+    logger.info("Loading %s: rows %s..%s (%s rows)", data_path.name, rows_loaded + 1, rows_loaded + len(remaining_lines), len(remaining_lines))
+    ok = run_psql_copy_stdin(Path(data_path.parent), copy_header_line, remaining_lines, psql_cmd, logger)
+    if not ok:
+        return False, rows_loaded
+    return True, rows_loaded + len(remaining_lines)
+
+
+def sorted_data_chunks(chunks_dir: Path) -> list[Path]:
+    """Return 03_data_*_part*.sql paths sorted by (schema, table, part)."""
+    paths = list(chunks_dir.glob("03_data_*_part*.sql"))
+    paths = [p for p in paths if ".repaired" not in p.name and ".meta" not in p.name]
+    paths.sort(key=lambda p: p.name)
+    return paths
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Restore DB from split dump chunks (idempotent, with row resume).")
+    ap.add_argument("chunks_dir", nargs="?", default=OUTPUT_DIR, help="Directory with 01_*.sql, 02_*.sql, ...")
+    ap.add_argument("--psql", default="psql", help="Path to psql (default: psql)")
+    ap.add_argument("--db", "-d", help="Database name (or set PGDATABASE)")
+    ap.add_argument("--host", "-h", help="Host (or set PGHOST)")
+    ap.add_argument("--port", "-p", help="Port (or set PGPORT)")
+    ap.add_argument("--user", "-U", help="User (or set PGUSER)")
+    ap.add_argument("--reset", action="store_true", help="Reset restore state and start from scratch (still runs chunks in order)")
+    args = ap.parse_args()
+
+    chunks_dir = Path(args.chunks_dir)
+    if not chunks_dir.is_dir():
+        print("Chunks directory not found:", chunks_dir, file=sys.stderr)
+        sys.exit(1)
+
+    logger = setup_logging(chunks_dir)
+    state = load_restore_state(chunks_dir)
+    if args.reset:
+        state = {"preamble_done": False, "schema_done": False, "data_files": {}}
+        save_restore_state(chunks_dir, state, logger)
+        logger.info("Restore state reset.")
+    if "preamble_done" not in state:
+        state["preamble_done"] = False
+    if "schema_done" not in state:
+        state["schema_done"] = False
+    if "data_files" not in state:
+        state["data_files"] = {}
+
+    psql_cmd = [args.psql]
+    if args.db:
+        psql_cmd.extend(["-d", args.db])
+    if args.host:
+        psql_cmd.extend(["-h", args.host])
+    if args.port:
+        psql_cmd.extend(["-p", args.port])
+    if args.user:
+        psql_cmd.extend(["-U", args.user])
+
+    # 01_preamble (skip if already done on resume)
+    if not state.get("preamble_done"):
+        p = chunks_dir / PREAMBLE_GLOB
+        if p.exists():
+            if not run_psql_file(chunks_dir, p, psql_cmd, logger):
+                sys.exit(1)
+            state["preamble_done"] = True
+            save_restore_state(chunks_dir, state, logger)
+        else:
+            logger.debug("No %s", PREAMBLE_GLOB)
+            state["preamble_done"] = True
+            save_restore_state(chunks_dir, state, logger)
+    else:
+        logger.info("Skipping 01_preamble (already done).")
+
+    # 02_schema_* (skip if already done on resume)
+    if not state.get("schema_done"):
+        schema_files = sorted(chunks_dir.glob(SCHEMA_GLOB))
+        for path in schema_files:
+            if not run_psql_file(chunks_dir, path, psql_cmd, logger):
+                sys.exit(1)
+        state["schema_done"] = True
+        save_restore_state(chunks_dir, state, logger)
+    else:
+        logger.info("Skipping 02_schema_* (already done).")
+
+    # 03_data_* (with resume)
+    data_files = sorted_data_chunks(chunks_dir)
+    for data_path in data_files:
+        meta_path = data_path.parent / (data_path.stem + ".meta.json")
+        if not meta_path.exists():
+            logger.warning("No meta for %s, skipping", data_path.name)
+            continue
+        with open(meta_path, encoding="utf-8") as mf:
+            meta = json.load(mf)
+        key = data_path.name
+        rows_loaded = state.get("data_files", {}).get(key, 0)
+        ok, new_count = stream_copy_remaining(data_path, meta, rows_loaded, psql_cmd, logger)
+        if not ok:
+            sys.exit(1)
+        state.setdefault("data_files", {})[key] = new_count
+        save_restore_state(chunks_dir, state, logger)
+
+    # 04_indexes, 05_functions, 06_views_triggers
+    for pattern in (INDEXES_GLOB, FUNCTIONS_GLOB, VIEWS_TRIGGERS_GLOB):
+        for path in sorted(chunks_dir.glob(pattern)):
+            if not path.is_file():
+                continue
+            if not run_psql_file(chunks_dir, path, psql_cmd, logger):
+                sys.exit(1)
+
+    logger.info("Restore finished successfully.")
+
+
+if __name__ == "__main__":
+    main()

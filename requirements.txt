@@ -1,0 +1,3 @@
+# WorkWithDump: split PostgreSQL dump and restore
+# Python 3.9+
+# No external deps required for split_dump, restore, validate_repair_table.
