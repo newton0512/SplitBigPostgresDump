@@ -19,6 +19,7 @@ from constants import (
     DUMP_FILENAME,
     INPUT_DIR,
     MAX_CARRY_OVER_IN_STATE_JSON,
+    MAX_CARRY_OVER_MEMORY,
     MAX_DATA_CHUNK_BYTES,
     MAX_STATE_JSON_BYTES,
     OUTPUT_DIR,
@@ -92,37 +93,37 @@ def setup_logging(out_dir: Path) -> logging.Logger:
     return logger
 
 
-def load_state(out_dir: Path) -> dict[str, Any] | None:
+def load_state(out_dir: Path) -> tuple[dict[str, Any] | None, Path | None]:
+    """Возвращает (state, spill_path). Если есть carry_over_file — не грузим его в память, возвращаем путь для стрима."""
     p = out_dir / STATE_FILENAME
     if not p.exists():
-        return None
+        return None, None
     if p.stat().st_size > MAX_STATE_JSON_BYTES:
         logging.getLogger(__name__).warning(
             "State file %s is too large (%s MB), not loading to avoid OOM; starting from beginning",
             p, p.stat().st_size // (1024 * 1024),
         )
-        return None
+        return None, None
     try:
         with open(p, encoding="utf-8") as f:
             raw = f.read()
         raw = raw.strip()
         if not raw:
             logging.getLogger(__name__).warning("State file %s is empty, starting from beginning", p)
-            return None
+            return None, None
         state = json.loads(raw)
-        # Большой carry_over хранится в отдельном файле, чтобы state.json не раздувался до гигабайт
         carry_file = state.pop("carry_over_file", None)
         if carry_file == CARRY_OVER_SIDE_FILENAME:
             side_path = out_dir / carry_file
             if side_path.exists():
-                with open(side_path, encoding="utf-8") as f:
-                    state["carry_over"] = f.read()
+                state["carry_over"] = ""
+                return state, side_path
         if "carry_over" not in state:
             state["carry_over"] = ""
-        return state
+        return state, None
     except (json.JSONDecodeError, OSError) as e:
         logging.getLogger(__name__).warning("State file %s invalid or unreadable (%s), starting from beginning", p, e)
-        return None
+        return None, None
 
 
 def save_state(out_dir: Path, state: dict[str, Any], logger: logging.Logger) -> None:
@@ -217,13 +218,16 @@ def run() -> None:
         logger.error("Input dump not found: %s", input_path)
         sys.exit(1)
 
-    state = load_state(out_dir)
+    state, initial_spill_path = load_state(out_dir)
     start_offset = 0
     initial_carry_over = ""
     if state:
         start_offset = state.get("last_processed_offset", 0)
         initial_carry_over = state.get("carry_over", "") or ""
-        logger.info("Resuming from offset %s (carry_over len=%s)", start_offset, len(initial_carry_over))
+        logger.info(
+            "Resuming from offset %s (carry_over len=%s, spill=%s)",
+            start_offset, len(initial_carry_over), initial_spill_path.name if initial_spill_path else None,
+        )
 
     # Open dump in binary mode
     with open(input_path, "rb") as f:
@@ -350,9 +354,11 @@ def run() -> None:
                 logger.info("Resumed appending to %s (rows so far=%s)", data_path.name, current_data_rows)
 
         carry_over = initial_carry_over
+        spill_path: Path | None = initial_spill_path
         bytes_processed = start_offset
         block_count = 0
         last_log_offset = start_offset
+        STREAM_CHUNK = 1024 * 1024  # 1 MB при стриме spill
 
         try:
             while True:
@@ -367,7 +373,52 @@ def run() -> None:
                 bytes_processed += len(block)
                 block_count += 1
 
-                lines, carry_over = split_lines_from_block(carry_over, decoded)
+                # Если carry_over уже слишком большой — сбрасываем на диск, дальше будем стримить
+                if spill_path is None and len(carry_over) >= MAX_CARRY_OVER_MEMORY:
+                    side_tmp = out_dir / (CARRY_OVER_SIDE_FILENAME + ".tmp")
+                    with open(side_tmp, "w", encoding="utf-8") as sf:
+                        sf.write(carry_over)
+                        sf.flush()
+                        os.fsync(sf.fileno())
+                    os.replace(side_tmp, out_dir / CARRY_OVER_SIDE_FILENAME)
+                    spill_path = out_dir / CARRY_OVER_SIDE_FILENAME
+                    carry_over = ""
+                    logger.info("Spilled carry_over to disk (%s MB), will stream", spill_path.stat().st_size // (1024 * 1024))
+
+                if spill_path is not None:
+                    # Стримим spill в data_handle по кускам (spill бывает только внутри COPY)
+                    if not inside_copy or data_handle is None:
+                        logger.warning("Spill file present but not inside COPY; reading into memory (may OOM)")
+                        with open(spill_path, "r", encoding="utf-8", newline="") as sf:
+                            spill_content = sf.read()
+                        lines, carry_over = split_lines_from_block(spill_content, decoded)
+                    else:
+                        with open(spill_path, "r", encoding="utf-8", newline="") as sf:
+                            while True:
+                                chunk = sf.read(STREAM_CHUNK)
+                                if not chunk:
+                                    break
+                                data_handle.write(chunk)
+                                current_data_bytes += len(chunk.encode("utf-8"))
+                        first_nl = decoded.find("\n")
+                        if first_nl != -1:
+                            line_to_write = decoded[: first_nl + 1].replace("\r\n", "\n").rstrip("\r\n") + OUTPUT_LINE_TERMINATOR
+                            data_handle.write(line_to_write)
+                            current_data_rows += 1
+                            current_data_bytes += len(line_to_write.encode("utf-8"))
+                            rest = decoded[first_nl + 1 :]
+                            lines, carry_over = split_lines_from_block("", rest)
+                        else:
+                            data_handle.write(decoded)
+                            current_data_bytes += len(decoded.encode("utf-8"))
+                            lines, carry_over = [], decoded
+                    try:
+                        spill_path.unlink()
+                    except OSError:
+                        pass
+                    spill_path = None
+                else:
+                    lines, carry_over = split_lines_from_block(carry_over, decoded)
 
                 for line in lines:
                     norm = _normalize_line(line)
