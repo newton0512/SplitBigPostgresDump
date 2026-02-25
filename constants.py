@@ -1,10 +1,13 @@
 # Paths and file names for dump split/restore (plan: split_postgresql_dump_and_repair)
-INPUT_DIR = "bckp"
-OUTPUT_DIR = "bckp_work"
-DUMP_FILENAME = "dump.sql"
-# INPUT_DIR = "/bckp"
-# OUTPUT_DIR = "/bckp_work"
-# DUMP_FILENAME = "dump-anon-db-test-20250905.sql"
+# local config
+# INPUT_DIR = "bckp"
+# OUTPUT_DIR = "bckp_work"
+# DUMP_FILENAME = "dump.sql"
+
+# server config
+INPUT_DIR = "/bckp"
+OUTPUT_DIR = "/bckp_work"
+DUMP_FILENAME = "dump-anon-db-test-20250905.sql"
 
 # Max size of a single data chunk file (3 GB)
 MAX_DATA_CHUNK_BYTES = 3 * 1024**3
