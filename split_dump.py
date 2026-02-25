@@ -442,6 +442,9 @@ def run() -> None:
                         if preamble_handle is not None:
                             preamble_handle.write(line_to_write)
 
+                # Освобождаем большие объекты до следующего read, чтобы снизить пиковое потребление RAM
+                del block, decoded, lines
+
                 # Persist state periodically (after each block)
                 state_to_save = {
                     "last_processed_offset": f.tell(),

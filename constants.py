@@ -12,8 +12,9 @@ DUMP_FILENAME = "dump-anon-db-test-20250905.sql"
 # Max size of a single data chunk file (3 GB)
 MAX_DATA_CHUNK_BYTES = 3 * 1024**3
 
-# Read block size when streaming the dump (256 MB; safe for ~3.4 GB available RAM)
-READ_BLOCK_BYTES = 256 * 1024 * 1024
+# Read block size when streaming the dump. На сервере с 3.8 GB RAM 256 MB давало OOM (~3.6 GB anon-rss);
+# 64 MB держит пиковое потребление в пределах ~200–400 MB.
+READ_BLOCK_BYTES = 64 * 1024 * 1024
 
 # Output line terminator: normalize to LF for predictable restore and row counting
 OUTPUT_LINE_TERMINATOR = "\n"

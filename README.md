@@ -16,7 +16,7 @@
 - `OUTPUT_DIR` — каталог для чанков и состояния (по умолчанию `/bckp_work`).
 - `DUMP_FILENAME` — имя файла дампа (например `dump-anon-db-test-20250905.sql`).
 - `MAX_DATA_CHUNK_BYTES` — максимальный размер одного файла с данными (по умолчанию 3 ГБ).
-- `READ_BLOCK_BYTES` — размер блока при потоковом чтении дампа (по умолчанию 256 МБ).
+- `READ_BLOCK_BYTES` — размер блока при потоковом чтении дампа (по умолчанию 64 МБ; при нехватке RAM уменьшите до 32 МБ).
 - Восстановление: `PG_HOST`, `PG_PORT`, `PG_USER`, `PG_DATABASE` — параметры подключения к PostgreSQL (если не заданы, используются переменные окружения или аргументы CLI). **Схема не настраивается** — объекты восстанавливаются в те же схемы, что и в дампе (например `public`).
 
 ## Структура чанков (в OUTPUT_DIR)
@@ -42,7 +42,7 @@ cd /path/to/WorkWithDump
 python3 split_dump.py
 ```
 
-- Дамп читается блоками по 256 МБ, чанки пишутся в `OUTPUT_DIR` (по умолчанию `/bckp_work`).
+- Дамп читается блоками по `READ_BLOCK_BYTES` (по умолчанию 64 МБ), чанки пишутся в `OUTPUT_DIR` (по умолчанию `/bckp_work`).
 - Состояние сохраняется в `OUTPUT_DIR/state.json` (смещение, фаза, carry_over и т.д.).
 - При ошибке достаточно запустить скрипт снова: он продолжит с `last_processed_offset` и `carry_over`.
 - Логи: `OUTPUT_DIR/split_dump.log` и вывод в stdout.
@@ -80,6 +80,15 @@ python3 validate_repair_table.py ИМЯ_ТАБЛИЦЫ [--schema СХЕМА] [ch
 - **Состояние split_dump** (`state.json`): `last_processed_offset`, `carry_over`, `current_phase`, `inside_copy`, `current_schema`, `current_table`, `current_part`, `current_columns`, `current_data_rows`, `current_data_bytes`, `current_data_file_path`, `indexes_part`, `functions_part`, `views_triggers_part`.
 - **Состояние восстановления** (`restore_state.json`): `preamble_done`, `schema_done`, `data_files` (соответствие имени файла данных и числа загруженных строк).
 - **Метаданные данных** (`03_data_*_partNNN.meta.json`): `schema`, `table`, `part`, `rows`, `columns` (список имён колонок из заголовка COPY).
+
+## Низкое потребление памяти (OOM)
+
+На машинах с небольшим объёмом RAM (например 3–4 ГБ) скрипт разбиения может быть убит OOM-killer. Сделано:
+
+- По умолчанию `READ_BLOCK_BYTES = 64 * 1024 * 1024` (64 МБ) вместо 256 МБ — пиковое потребление заметно ниже.
+- После обработки каждого блока большие объекты явно удаляются (`del block, decoded, lines`), чтобы не держать лишние ссылки до следующей итерации.
+
+Если OOM всё ещё возникает, в `constants.py` уменьшите `READ_BLOCK_BYTES` до 32 МБ или меньше. После сбоя достаточно снова запустить `split_dump.py` — продолжение идёт с `state.json`.
 
 ## Окончания строк
 
