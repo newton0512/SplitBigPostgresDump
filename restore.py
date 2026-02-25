@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -69,22 +70,56 @@ def save_restore_state(chunks_dir: Path, state: dict, logger: logging.Logger) ->
     logger.debug("Restore state saved.")
 
 
-def run_psql_file(chunks_dir: Path, path: Path, psql_cmd: list[str], logger: logging.Logger) -> bool:
-    """Run psql -f path. Returns True on success."""
-    cmd = psql_cmd + ["-f", str(path)]
-    logger.info("Executing %s", path.name)
-    try:
-        r = subprocess.run(cmd, cwd=str(chunks_dir), capture_output=True, text=True, timeout=3600)
-        if r.returncode != 0:
-            logger.error("psql failed for %s: %s", path.name, r.stderr or r.stdout)
+def run_psql_file(
+    chunks_dir: Path,
+    path: Path,
+    psql_cmd: list[str],
+    logger: logging.Logger,
+    *,
+    stdin_from_file: bool = False,
+) -> bool:
+    """Run psql -f path, or pass file content via stdin (for docker exec). Returns True on success."""
+    if stdin_from_file:
+        sql_content = path.read_text(encoding="utf-8", errors="replace")
+        cmd = psql_cmd
+        logger.info("Executing %s (via stdin)", path.name)
+        try:
+            r = subprocess.run(
+                cmd,
+                cwd=str(chunks_dir),
+                input=sql_content,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=3600,
+            )
+            if r.returncode != 0:
+                logger.error("psql failed for %s: %s", path.name, r.stderr or r.stdout)
+                return False
+            return True
+        except subprocess.TimeoutExpired:
+            logger.error("psql timed out for %s", path.name)
             return False
-        return True
-    except subprocess.TimeoutExpired:
-        logger.error("psql timed out for %s", path.name)
-        return False
-    except Exception as e:
-        logger.exception("psql error for %s: %s", path.name, e)
-        return False
+        except Exception as e:
+            logger.exception("psql error for %s: %s", path.name, e)
+            return False
+    else:
+        cmd = psql_cmd + ["-f", str(path)]
+        logger.info("Executing %s", path.name)
+        try:
+            r = subprocess.run(
+                cmd, cwd=str(chunks_dir), capture_output=True, text=True, encoding="utf-8", timeout=3600
+            )
+            if r.returncode != 0:
+                logger.error("psql failed for %s: %s", path.name, r.stderr or r.stdout)
+                return False
+            return True
+        except subprocess.TimeoutExpired:
+            logger.error("psql timed out for %s", path.name)
+            return False
+        except Exception as e:
+            logger.exception("psql error for %s: %s", path.name, e)
+            return False
 
 
 def run_psql_copy_stdin(
@@ -105,6 +140,7 @@ def run_psql_copy_stdin(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
         )
         out, err = proc.communicate(input=data, timeout=3600)
         if proc.returncode != 0:
@@ -120,12 +156,38 @@ def run_psql_copy_stdin(
         return False
 
 
+def run_truncate_table(
+    schema: str,
+    table: str,
+    psql_cmd: list[str],
+    chunks_dir: Path,
+    logger: logging.Logger,
+) -> bool:
+    """Run TRUNCATE schema.table before first COPY to avoid duplicate key when table already has data."""
+    # Имя с кавычками на случай mixed case
+    quoted = f'"{schema}"."{table}"'
+    cmd = psql_cmd + ["-c", f"TRUNCATE TABLE {quoted} CASCADE;"]
+    try:
+        r = subprocess.run(cmd, cwd=str(chunks_dir), capture_output=True, text=True, encoding="utf-8", timeout=60)
+        if r.returncode != 0:
+            logger.warning("TRUNCATE %s failed (table may not exist yet): %s", quoted, (r.stderr or r.stdout).strip())
+            return False
+        logger.debug("TRUNCATE %s", quoted)
+        return True
+    except Exception as e:
+        logger.warning("TRUNCATE %s error: %s", quoted, e)
+        return False
+
+
 def stream_copy_remaining(
     data_path: Path,
     meta: dict,
     rows_loaded: int,
     psql_cmd: list[str],
     logger: logging.Logger,
+    *,
+    truncate_before_first: bool = False,
+    chunks_dir: Path | None = None,
 ) -> tuple[bool, int]:
     """
     For a data chunk file: skip first line (COPY header) and rows_loaded data lines,
@@ -137,7 +199,7 @@ def stream_copy_remaining(
         logger.info("Skip %s (already loaded %s/%s rows)", data_path.name, rows_loaded, total_rows)
         return True, rows_loaded
 
-    with open(data_path, "r", encoding="utf-8", newline="") as f:
+    with open(data_path, "r", encoding="utf-8", errors="replace", newline="") as f:
         copy_header_line = f.readline()
         if not COPY_FROM_STDIN_RE.match(copy_header_line.strip()):
             logger.error("%s: first line is not COPY ... FROM stdin", data_path.name)
@@ -163,6 +225,11 @@ def stream_copy_remaining(
     if not remaining_lines and rows_loaded == total_rows:
         return True, total_rows
 
+    if truncate_before_first and chunks_dir is not None:
+        schema_name = meta.get("schema", "public")
+        table_name = meta.get("table", "")
+        run_truncate_table(schema_name, table_name, psql_cmd, chunks_dir, logger)
+
     logger.info("Loading %s: rows %s..%s (%s rows)", data_path.name, rows_loaded + 1, rows_loaded + len(remaining_lines), len(remaining_lines))
     ok = run_psql_copy_stdin(Path(data_path.parent), copy_header_line, remaining_lines, psql_cmd, logger)
     if not ok:
@@ -187,9 +254,10 @@ def main() -> None:
     ap.add_argument("chunks_dir", nargs="?", default=OUTPUT_DIR, help="Каталог с чанками 01_*.sql, 02_*.sql, ...")
     ap.add_argument("--psql", default="psql", help="Путь к psql")
     ap.add_argument("--db", "-d", default=PG_DATABASE, help="База данных (по умолчанию: constants.PG_DATABASE или PGDATABASE)")
-    ap.add_argument("--host", "-h", default=PG_HOST, help="Хост PostgreSQL (по умолчанию: constants.PG_HOST или PGHOST)")
+    ap.add_argument("--host", default=PG_HOST, help="Хост PostgreSQL (по умолчанию: constants.PG_HOST или PGHOST)")
     ap.add_argument("--port", "-p", default=PG_PORT, help="Порт (по умолчанию: constants.PG_PORT или PGPORT)")
     ap.add_argument("--user", "-U", default=PG_USER, help="Пользователь (по умолчанию: constants.PG_USER или PGUSER)")
+    ap.add_argument("--docker", metavar="CONTAINER", help="Запускать psql через docker exec -i CONTAINER psql (PostgreSQL в Docker)")
     ap.add_argument("--reset", action="store_true", help="Сбросить состояние восстановления и начать с начала")
     args = ap.parse_args()
 
@@ -211,21 +279,50 @@ def main() -> None:
     if "data_files" not in state:
         state["data_files"] = {}
 
-    psql_cmd = [args.psql]
-    if args.db is not None:
-        psql_cmd.extend(["-d", str(args.db)])
-    if args.host is not None:
-        psql_cmd.extend(["-h", str(args.host)])
-    if args.port is not None:
-        psql_cmd.extend(["-p", str(args.port)])
-    if args.user is not None:
-        psql_cmd.extend(["-U", str(args.user)])
+    if args.docker:
+        # psql внутри контейнера: не нужен psql на хосте, файлы передаём через stdin
+        psql_cmd = ["docker", "exec", "-i", args.docker, "psql"]
+        if args.db is not None:
+            psql_cmd.extend(["-d", str(args.db)])
+        if args.user is not None:
+            psql_cmd.extend(["-U", str(args.user)])
+        # -h/-p внутри контейнера обычно не нужны (подключение к localhost)
+        use_stdin_for_files = True
+        logger.info("Restore via Docker container: %s", args.docker)
+    else:
+        psql_cmd = [args.psql]
+        if args.db is not None:
+            psql_cmd.extend(["-d", str(args.db)])
+        if args.host is not None:
+            psql_cmd.extend(["-h", str(args.host)])
+        if args.port is not None:
+            psql_cmd.extend(["-p", str(args.port)])
+        if args.user is not None:
+            psql_cmd.extend(["-U", str(args.user)])
+        # Проверка наличия psql на хосте
+        psql_exe = args.psql
+        if os.path.sep in psql_exe or (os.name == "nt" and ":" in psql_exe):
+            if not Path(psql_exe).exists():
+                logger.error(
+                    "psql не найден: %s. Укажите полный путь или используйте --docker CONTAINER",
+                    psql_exe,
+                )
+                sys.exit(1)
+        else:
+            found = shutil.which(psql_exe) or (shutil.which(psql_exe + ".exe") if os.name == "nt" else None)
+            if not found:
+                logger.error(
+                    "psql не найден в PATH. Добавьте PostgreSQL/bin в PATH или укажите --docker ИМЯ_КОНТЕЙНЕРА"
+                )
+                sys.exit(1)
+            psql_cmd[0] = found
+        use_stdin_for_files = False
 
     logger.info(
         "Restore target: db=%s host=%s port=%s user=%s (schema from dump, e.g. public)",
         args.db or "(PGDATABASE)",
-        args.host or "(PGHOST/localhost)",
-        args.port or "(PGPORT/5432)",
+        args.host or "(PGHOST/localhost)" if not args.docker else "(inside container)",
+        args.port or "(PGPORT/5432)" if not args.docker else "-",
         args.user or "(PGUSER)",
     )
 
@@ -233,7 +330,7 @@ def main() -> None:
     if not state.get("preamble_done"):
         p = chunks_dir / PREAMBLE_GLOB
         if p.exists():
-            if not run_psql_file(chunks_dir, p, psql_cmd, logger):
+            if not run_psql_file(chunks_dir, p, psql_cmd, logger, stdin_from_file=use_stdin_for_files):
                 sys.exit(1)
             state["preamble_done"] = True
             save_restore_state(chunks_dir, state, logger)
@@ -248,7 +345,7 @@ def main() -> None:
     if not state.get("schema_done"):
         schema_files = sorted(chunks_dir.glob(SCHEMA_GLOB))
         for path in schema_files:
-            if not run_psql_file(chunks_dir, path, psql_cmd, logger):
+            if not run_psql_file(chunks_dir, path, psql_cmd, logger, stdin_from_file=use_stdin_for_files):
                 sys.exit(1)
         state["schema_done"] = True
         save_restore_state(chunks_dir, state, logger)
@@ -264,10 +361,34 @@ def main() -> None:
             continue
         with open(meta_path, encoding="utf-8") as mf:
             meta = json.load(mf)
+        schema_name = meta.get("schema", "public")
+        table_name = meta.get("table", "")
+        schema_file = chunks_dir / f"02_schema_{schema_name}_{table_name}.sql"
+        if not schema_file.exists():
+            logger.warning(
+                "Нет файла схемы %s для таблицы %s.%s — пропускаем загрузку данных. Таблица может создаваться в 01_preamble (расширение) или в другом 02_schema_*.sql. При необходимости создайте таблицу и запустите restore снова.",
+                schema_file.name,
+                schema_name,
+                table_name,
+            )
+            continue
         key = data_path.name
         rows_loaded = state.get("data_files", {}).get(key, 0)
-        ok, new_count = stream_copy_remaining(data_path, meta, rows_loaded, psql_cmd, logger)
+        part_num = meta.get("part", 1)
+        truncate_before = part_num == 1 and rows_loaded == 0
+        ok, new_count = stream_copy_remaining(
+            data_path, meta, rows_loaded, psql_cmd, logger,
+            truncate_before_first=truncate_before,
+            chunks_dir=chunks_dir if truncate_before else None,
+        )
         if not ok:
+            logger.error(
+                "Если ошибка «relation ... does not exist»: таблица %s.%s не создана до загрузки данных. Проверьте, что 02_schema_%s_%s.sql выполнился без ошибок и что схема/таблица не создаются в 01_preamble (например расширением).",
+                schema_name,
+                table_name,
+                schema_name,
+                table_name,
+            )
             sys.exit(1)
         state.setdefault("data_files", {})[key] = new_count
         save_restore_state(chunks_dir, state, logger)
@@ -277,7 +398,7 @@ def main() -> None:
         for path in sorted(chunks_dir.glob(pattern)):
             if not path.is_file():
                 continue
-            if not run_psql_file(chunks_dir, path, psql_cmd, logger):
+            if not run_psql_file(chunks_dir, path, psql_cmd, logger, stdin_from_file=use_stdin_for_files):
                 sys.exit(1)
 
     logger.info("Restore finished successfully.")

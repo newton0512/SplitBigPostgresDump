@@ -186,15 +186,15 @@ def run() -> None:
 
         phase = state.get("current_phase", "preamble") if state else "preamble"
         inside_copy = state.get("inside_copy", False) if state else False
-        current_schema = state.get("current_schema", "")
-        current_table = state.get("current_table", "")
-        current_part = state.get("current_part", 0)
-        current_columns: list[str] = state.get("current_columns") or []
-        current_data_rows = state.get("current_data_rows", 0)
-        current_data_bytes = state.get("current_data_bytes", 0)
-        indexes_part = state.get("indexes_part", 0)
-        functions_part = state.get("functions_part", 0)
-        views_triggers_part = state.get("views_triggers_part", 0)
+        current_schema = state.get("current_schema", "") if state else ""
+        current_table = state.get("current_table", "") if state else ""
+        current_part = state.get("current_part", 0) if state else 0
+        current_columns = (state.get("current_columns") or []) if state else []
+        current_data_rows = state.get("current_data_rows", 0) if state else 0
+        current_data_bytes = state.get("current_data_bytes", 0) if state else 0
+        indexes_part = state.get("indexes_part", 0) if state else 0
+        functions_part = state.get("functions_part", 0) if state else 0
+        views_triggers_part = state.get("views_triggers_part", 0) if state else 0
 
         def open_preamble() -> None:
             nonlocal preamble_handle
@@ -203,14 +203,17 @@ def run() -> None:
                 preamble_handle = open(p, "a", encoding="utf-8", newline="")
                 logger.info("Writing to 01_preamble.sql")
 
-        def open_schema(schema: str, table: str) -> None:
+        def open_schema(schema: str, table: str):
+            """Close current schema file, open new one for this table. Returns the new file handle."""
             nonlocal schema_handle
             if schema_handle is not None:
                 schema_handle.close()
                 schema_handle = None
             p = out_dir / f"02_schema_{schema}_{table}.sql"
-            schema_handle = open(p, "a", encoding="utf-8", newline="")
+            new_handle = open(p, "a", encoding="utf-8", newline="")
+            schema_handle = new_handle
             logger.info("Writing to 02_schema_%s_%s.sql", schema, table)
+            return new_handle
 
         def open_data_part(schema: str, table: str, part: int, write_header: bool, copy_header_line: str) -> None:
             nonlocal data_handle, current_data_bytes, current_data_rows
@@ -363,33 +366,34 @@ def run() -> None:
                         inside_copy = True
                         continue
 
-                    # Post-data: CREATE INDEX / FUNCTION / VIEW / TRIGGER / RULE
-                    if CREATE_INDEX_RE.match(norm):
-                        if phase != "post_data":
-                            phase = "post_data"
-                            if indexes_handle is None:
-                                open_indexes()
-                        if indexes_handle is not None:
-                            indexes_handle.write(line_to_write)
-                        continue
-                    if CREATE_FUNCTION_RE.match(norm):
-                        if phase != "post_data":
-                            phase = "post_data"
-                        if functions_handle is None:
-                            open_functions()
-                        if functions_handle is not None:
-                            functions_handle.write(line_to_write)
-                        continue
-                    if CREATE_VIEW_RE.match(norm) or CREATE_TRIGGER_RE.match(norm) or CREATE_RULE_RE.match(norm):
-                        if phase != "post_data":
-                            phase = "post_data"
-                        if views_triggers_handle is None:
-                            open_views_triggers()
-                        if views_triggers_handle is not None:
-                            views_triggers_handle.write(line_to_write)
-                        continue
+                    # Post-data: CREATE INDEX / FUNCTION / VIEW / TRIGGER / RULE (только после секции data, иначе строки из CREATE TABLE могут ложно сработать)
+                    if phase != "schema":
+                        if CREATE_INDEX_RE.match(norm):
+                            if phase != "post_data":
+                                phase = "post_data"
+                                if indexes_handle is None:
+                                    open_indexes()
+                            if indexes_handle is not None:
+                                indexes_handle.write(line_to_write)
+                            continue
+                        if CREATE_FUNCTION_RE.match(norm):
+                            if phase != "post_data":
+                                phase = "post_data"
+                            if functions_handle is None:
+                                open_functions()
+                            if functions_handle is not None:
+                                functions_handle.write(line_to_write)
+                            continue
+                        if CREATE_VIEW_RE.match(norm) or CREATE_TRIGGER_RE.match(norm) or CREATE_RULE_RE.match(norm):
+                            if phase != "post_data":
+                                phase = "post_data"
+                            if views_triggers_handle is None:
+                                open_views_triggers()
+                            if views_triggers_handle is not None:
+                                views_triggers_handle.write(line_to_write)
+                            continue
 
-                    # CREATE TABLE
+                    # CREATE TABLE — каждый в свой 02_schema_<schema>_<table>.sql с полным определением
                     create_table_match = CREATE_TABLE_RE.match(norm)
                     if create_table_match:
                         ref = create_table_match.group(1).strip()
@@ -400,7 +404,7 @@ def run() -> None:
                                 preamble_handle = None
                             phase = "schema"
                         if phase == "schema":
-                            open_schema(schema, table)
+                            schema_handle = open_schema(schema, table)  # явно присваиваем новый handle
                         if schema_handle is not None:
                             schema_handle.write(line_to_write)
                         continue
@@ -410,8 +414,8 @@ def run() -> None:
                         schema_handle.write(line_to_write)
                         continue
 
-                    # SELECT pg_catalog.pg_... (sequence setval etc.) - often in post-data
-                    if SELECT_PG_RE.match(norm):
+                    # SELECT pg_catalog.pg_... (sequence setval etc.) - только не в schema
+                    if phase != "schema" and SELECT_PG_RE.match(norm):
                         if phase != "post_data":
                             phase = "post_data"
                             if views_triggers_handle is None:

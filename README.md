@@ -53,6 +53,8 @@ python3 split_dump.py
 
 ```bash
 python3 restore.py [chunks_dir] [--db ИМЯ_БД] [--host ХОСТ] [--port ПОРТ] [--user ПОЛЬЗОВАТЕЛЬ] [--reset]
+# Если PostgreSQL в Docker (psql на хосте не нужен):
+python3 restore.py bckp_work --docker ИМЯ_КОНТЕЙНЕРА --db pg_from_copy --user postgres
 ```
 
 - Выполняются по порядку: `01_preamble.sql`, все `02_schema_*.sql`, затем каждый `03_data_*_part*.sql` (с учётом уже загруженных строк), затем `04_*`, `05_*`, `06_*`.

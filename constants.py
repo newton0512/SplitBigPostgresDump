@@ -1,7 +1,10 @@
 # Paths and file names for dump split/restore (plan: split_postgresql_dump_and_repair)
-INPUT_DIR = "/bckp"
-OUTPUT_DIR = "/bckp_work"
-DUMP_FILENAME = "dump-anon-db-test-20250905.sql"
+INPUT_DIR = "bckp"
+OUTPUT_DIR = "bckp_work"
+DUMP_FILENAME = "dump.sql"
+# INPUT_DIR = "/bckp"
+# OUTPUT_DIR = "/bckp_work"
+# DUMP_FILENAME = "dump-anon-db-test-20250905.sql"
 
 # Max size of a single data chunk file (3 GB)
 MAX_DATA_CHUNK_BYTES = 3 * 1024**3
@@ -20,7 +23,7 @@ VALIDATE_REPAIR_LOG_FILENAME = "validate_repair.log"
 
 # Restore: подключение к PostgreSQL (если None — используются переменные окружения PGHOST/PGPORT/PGUSER/PGDATABASE или аргументы CLI).
 # Схема не задаётся здесь: восстановление идёт в те же схемы, что и в дампе (например public).
-PG_HOST = None
-PG_PORT = None
-PG_USER = None
-PG_DATABASE = None
+PG_HOST = "localhost"
+PG_PORT = 5432
+PG_USER = "postgres"
+PG_DATABASE = "pg_from_copy"
