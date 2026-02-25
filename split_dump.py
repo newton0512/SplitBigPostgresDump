@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -92,14 +93,28 @@ def load_state(out_dir: Path) -> dict[str, Any] | None:
     p = out_dir / STATE_FILENAME
     if not p.exists():
         return None
-    with open(p, encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(p, encoding="utf-8") as f:
+            raw = f.read()
+        raw = raw.strip()
+        if not raw:
+            logging.getLogger(__name__).warning("State file %s is empty, starting from beginning", p)
+            return None
+        return json.loads(raw)
+    except (json.JSONDecodeError, OSError) as e:
+        logging.getLogger(__name__).warning("State file %s invalid or unreadable (%s), starting from beginning", p, e)
+        return None
 
 
 def save_state(out_dir: Path, state: dict[str, Any], logger: logging.Logger) -> None:
+    """Пишем во временный файл и атомарно заменяем state.json, чтобы при OOM/kill не оставался пустой файл."""
     p = out_dir / STATE_FILENAME
-    with open(p, "w", encoding="utf-8") as f:
+    tmp = out_dir / (STATE_FILENAME + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
     logger.debug("State saved: offset=%s phase=%s", state.get("last_processed_offset"), state.get("current_phase"))
 
 
