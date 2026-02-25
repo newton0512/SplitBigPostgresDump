@@ -15,9 +15,12 @@ from pathlib import Path
 from typing import Any
 
 from constants import (
+    CARRY_OVER_SIDE_FILENAME,
     DUMP_FILENAME,
     INPUT_DIR,
+    MAX_CARRY_OVER_IN_STATE_JSON,
     MAX_DATA_CHUNK_BYTES,
+    MAX_STATE_JSON_BYTES,
     OUTPUT_DIR,
     OUTPUT_LINE_TERMINATOR,
     READ_BLOCK_BYTES,
@@ -93,6 +96,12 @@ def load_state(out_dir: Path) -> dict[str, Any] | None:
     p = out_dir / STATE_FILENAME
     if not p.exists():
         return None
+    if p.stat().st_size > MAX_STATE_JSON_BYTES:
+        logging.getLogger(__name__).warning(
+            "State file %s is too large (%s MB), not loading to avoid OOM; starting from beginning",
+            p, p.stat().st_size // (1024 * 1024),
+        )
+        return None
     try:
         with open(p, encoding="utf-8") as f:
             raw = f.read()
@@ -100,14 +109,44 @@ def load_state(out_dir: Path) -> dict[str, Any] | None:
         if not raw:
             logging.getLogger(__name__).warning("State file %s is empty, starting from beginning", p)
             return None
-        return json.loads(raw)
+        state = json.loads(raw)
+        # Большой carry_over хранится в отдельном файле, чтобы state.json не раздувался до гигабайт
+        carry_file = state.pop("carry_over_file", None)
+        if carry_file == CARRY_OVER_SIDE_FILENAME:
+            side_path = out_dir / carry_file
+            if side_path.exists():
+                with open(side_path, encoding="utf-8") as f:
+                    state["carry_over"] = f.read()
+        if "carry_over" not in state:
+            state["carry_over"] = ""
+        return state
     except (json.JSONDecodeError, OSError) as e:
         logging.getLogger(__name__).warning("State file %s invalid or unreadable (%s), starting from beginning", p, e)
         return None
 
 
 def save_state(out_dir: Path, state: dict[str, Any], logger: logging.Logger) -> None:
-    """Пишем во временный файл и атомарно заменяем state.json, чтобы при OOM/kill не оставался пустой файл."""
+    """Пишем во временный файл и атомарно заменяем state.json. Большой carry_over — в отдельный файл."""
+    state = dict(state)
+    carry = state.get("carry_over") or ""
+    if len(carry) > MAX_CARRY_OVER_IN_STATE_JSON:
+        side_path = out_dir / CARRY_OVER_SIDE_FILENAME
+        side_tmp = out_dir / (CARRY_OVER_SIDE_FILENAME + ".tmp")
+        with open(side_tmp, "w", encoding="utf-8") as f:
+            f.write(carry)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(side_tmp, side_path)
+        state["carry_over"] = ""
+        state["carry_over_file"] = CARRY_OVER_SIDE_FILENAME
+    else:
+        state.pop("carry_over_file", None)
+        side_path = out_dir / CARRY_OVER_SIDE_FILENAME
+        if side_path.exists():
+            try:
+                side_path.unlink()
+            except OSError:
+                pass
     p = out_dir / STATE_FILENAME
     tmp = out_dir / (STATE_FILENAME + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:

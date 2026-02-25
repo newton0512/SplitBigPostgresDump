@@ -21,6 +21,9 @@ OUTPUT_LINE_TERMINATOR = "\n"
 
 # State and meta file names
 STATE_FILENAME = "state.json"
+CARRY_OVER_SIDE_FILENAME = "state_carry_over.bin"  # большой carry_over пишем сюда, в JSON не кладём
+MAX_CARRY_OVER_IN_STATE_JSON = 512 * 1024  # 512 KB; иначе state.json раздувается до гигабайт (одна длинная строка COPY)
+MAX_STATE_JSON_BYTES = 100 * 1024 * 1024  # 100 MB; больший state.json не грузим (старая запись без side file), чтобы не OOM
 RESTORE_STATE_FILENAME = "restore_state.json"
 SPLIT_LOG_FILENAME = "split_dump.log"
 VALIDATE_REPAIR_LOG_FILENAME = "validate_repair.log"

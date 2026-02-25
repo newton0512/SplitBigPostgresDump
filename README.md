@@ -77,7 +77,7 @@ python3 validate_repair_table.py ИМЯ_ТАБЛИЦЫ [--schema СХЕМА] [ch
 
 ## Файлы состояния и метаданных
 
-- **Состояние split_dump** (`state.json`): `last_processed_offset`, `carry_over`, `current_phase`, `inside_copy`, `current_schema`, `current_table`, `current_part`, `current_columns`, `current_data_rows`, `current_data_bytes`, `current_data_file_path`, `indexes_part`, `functions_part`, `views_triggers_part`.
+- **Состояние split_dump** (`state.json`): `last_processed_offset`, `carry_over` (или `carry_over_file`), `current_phase`, `inside_copy`, … Если «хвост» блока (`carry_over`) больше 512 КБ — он пишется в `state_carry_over.bin`, а в JSON остаётся `carry_over_file`, чтобы state.json не раздувался до гигабайт на таблицах с очень длинными строками.
 - **Состояние восстановления** (`restore_state.json`): `preamble_done`, `schema_done`, `data_files` (соответствие имени файла данных и числа загруженных строк).
 - **Метаданные данных** (`03_data_*_partNNN.meta.json`): `schema`, `table`, `part`, `rows`, `columns` (список имён колонок из заголовка COPY).
 
@@ -87,6 +87,7 @@ python3 validate_repair_table.py ИМЯ_ТАБЛИЦЫ [--schema СХЕМА] [ch
 
 - По умолчанию `READ_BLOCK_BYTES = 64 * 1024 * 1024` (64 МБ) вместо 256 МБ — пиковое потребление заметно ниже.
 - После обработки каждого блока большие объекты явно удаляются (`del block, decoded, lines`), чтобы не держать лишние ссылки до следующей итерации.
+- Большой `carry_over` (неоконченная строка COPY) сохраняется в отдельный файл `state_carry_over.bin`, а не в JSON — иначе одна длинная строка в дампе раздувала бы state.json до гигабайт и снова вызывала OOM при записи/чтении. Если `state.json` больше 100 МБ, он не загружается (считается старой записью без side file), и разбиение стартует с начала.
 
 Если OOM всё ещё возникает, в `constants.py` уменьшите `READ_BLOCK_BYTES` до 32 МБ или меньше. После сбоя достаточно снова запустить `split_dump.py` — продолжение идёт с `state.json`.
 
