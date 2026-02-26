@@ -18,6 +18,9 @@ from constants import (
     CARRY_OVER_SIDE_FILENAME,
     DUMP_FILENAME,
     INPUT_DIR,
+    JUNK_LINE_MAX_NON_JUNK_RATIO,
+    JUNK_LINE_SAMPLE_BYTES,
+    JUNK_LINE_THRESHOLD_BYTES,
     MAX_CARRY_OVER_IN_STATE_JSON,
     MAX_CARRY_OVER_MEMORY,
     MAX_DATA_CHUNK_BYTES,
@@ -244,6 +247,8 @@ def run() -> None:
 
         phase = state.get("current_phase", "preamble") if state else "preamble"
         inside_copy = state.get("inside_copy", False) if state else False
+        inside_junk_line = state.get("inside_junk_line", False) if state else False
+        junk_line_start_in_buffer = 0  # при resume в junk-режиме считаем с 0 (carry_over тогда пустой)
         current_schema = state.get("current_schema", "") if state else ""
         current_table = state.get("current_table", "") if state else ""
         current_part = state.get("current_part", 0) if state else 0
@@ -373,62 +378,118 @@ def run() -> None:
                 bytes_processed += len(block)
                 block_count += 1
 
-                # Если carry_over уже слишком большой — сбрасываем на диск, дальше будем стримить
-                if spill_path is None and len(carry_over) >= MAX_CARRY_OVER_MEMORY:
-                    side_tmp = out_dir / (CARRY_OVER_SIDE_FILENAME + ".tmp")
-                    with open(side_tmp, "w", encoding="utf-8") as sf:
-                        sf.write(carry_over)
-                        sf.flush()
-                        os.fsync(sf.fileno())
-                    os.replace(side_tmp, out_dir / CARRY_OVER_SIDE_FILENAME)
-                    spill_path = out_dir / CARRY_OVER_SIDE_FILENAME
-                    carry_over = ""
-                    logger.info("Spilled carry_over to disk (%s MB), will stream", spill_path.stat().st_size // (1024 * 1024))
-
-                if spill_path is not None:
-                    # Стримим spill в data_handle по кускам (spill бывает только внутри COPY)
-                    if not inside_copy or data_handle is None:
-                        logger.warning("Spill file present but not inside COPY; reading into memory (may OOM)")
-                        with open(spill_path, "r", encoding="utf-8", newline="") as sf:
-                            spill_content = sf.read()
-                        lines, carry_over = split_lines_from_block(spill_content, decoded)
-                    else:
-                        with open(spill_path, "r", encoding="utf-8", newline="") as sf:
-                            while True:
-                                chunk = sf.read(STREAM_CHUNK)
-                                if not chunk:
-                                    break
-                                data_handle.write(chunk)
-                                current_data_bytes += len(chunk.encode("utf-8"))
-                        first_nl = decoded.find("\n")
-                        if first_nl != -1:
-                            line_to_write = decoded[: first_nl + 1].replace("\r\n", "\n").rstrip("\r\n") + OUTPUT_LINE_TERMINATOR
-                            data_handle.write(line_to_write)
-                            current_data_rows += 1
-                            current_data_bytes += len(line_to_write.encode("utf-8"))
-                            rest = decoded[first_nl + 1 :]
-                            lines, carry_over = split_lines_from_block("", rest)
-                        else:
-                            data_handle.write(decoded)
-                            current_data_bytes += len(decoded.encode("utf-8"))
-                            lines, carry_over = [], decoded
-                        if current_data_bytes >= MAX_DATA_CHUNK_BYTES:
-                            close_data_part_and_write_meta()
-                            current_part += 1
-                            open_data_part(
-                                current_schema,
-                                current_table,
-                                current_part,
-                                write_header=True,
-                                copy_header_line=f"COPY {current_schema}.{current_table} ({','.join(current_columns)}) FROM stdin;\n",
+                did_junk_handling = False
+                if inside_copy and spill_path is None and len(carry_over) >= JUNK_LINE_THRESHOLD_BYTES and not inside_junk_line:
+                    current_line_start = carry_over.rfind("\n") + 1 if "\n" in carry_over else 0
+                    current_line_len = len(carry_over) - current_line_start
+                    if current_line_len >= JUNK_LINE_THRESHOLD_BYTES:
+                        sample_size = min(JUNK_LINE_SAMPLE_BYTES, current_line_len)
+                        sample = carry_over[current_line_start : current_line_start + sample_size]
+                        if sample:
+                            non_junk = (
+                                len(sample)
+                                - sample.count("\x00")
+                                - sample.count(" ")
+                                - sample.count("\t")
+                                - sample.count("\n")
+                                - sample.count("\r")
                             )
-                    try:
-                        spill_path.unlink()
-                    except OSError:
-                        pass
-                    spill_path = None
-                else:
-                    lines, carry_over = split_lines_from_block(carry_over, decoded)
+                            if non_junk < JUNK_LINE_MAX_NON_JUNK_RATIO * len(sample):
+                                inside_junk_line = True
+                                junk_line_start_in_buffer = current_line_start
+                                logger.info(
+                                    "Junk line detected (~%s MB), skipping until newline",
+                                    current_line_len // (1024 * 1024),
+                                )
+
+                if inside_copy and inside_junk_line:
+                    did_junk_handling = True
+                    buffer = carry_over + decoded
+                    first_nl = buffer.find("\n", junk_line_start_in_buffer)
+                    if first_nl != -1:
+                        carry_over = buffer[first_nl + 1 :]
+                        if len(carry_over) > MAX_CARRY_OVER_MEMORY:
+                            carry_over = carry_over[-MAX_CARRY_OVER_MEMORY:]
+                        replacement = "\t".join(["\\N"] * len(current_columns)) + OUTPUT_LINE_TERMINATOR
+                        if data_handle is not None:
+                            data_handle.write(replacement)
+                            current_data_rows += 1
+                            current_data_bytes += len(replacement.encode("utf-8"))
+                            if current_data_bytes >= MAX_DATA_CHUNK_BYTES:
+                                close_data_part_and_write_meta()
+                                current_part += 1
+                                open_data_part(
+                                    current_schema,
+                                    current_table,
+                                    current_part,
+                                    write_header=True,
+                                    copy_header_line=f"COPY {current_schema}.{current_table} ({','.join(current_columns)}) FROM stdin;\n",
+                                )
+                        inside_junk_line = False
+                        junk_line_start_in_buffer = 0
+                        lines, carry_over = split_lines_from_block(carry_over, "")
+                    else:
+                        carry_over = ""
+                        junk_line_start_in_buffer = 0
+                        lines = []
+
+                if not did_junk_handling:
+                    # Если carry_over уже слишком большой — сбрасываем на диск, дальше будем стримить
+                    if spill_path is None and len(carry_over) >= MAX_CARRY_OVER_MEMORY:
+                        side_tmp = out_dir / (CARRY_OVER_SIDE_FILENAME + ".tmp")
+                        with open(side_tmp, "w", encoding="utf-8") as sf:
+                            sf.write(carry_over)
+                            sf.flush()
+                            os.fsync(sf.fileno())
+                        os.replace(side_tmp, out_dir / CARRY_OVER_SIDE_FILENAME)
+                        spill_path = out_dir / CARRY_OVER_SIDE_FILENAME
+                        carry_over = ""
+                        logger.info("Spilled carry_over to disk (%s MB), will stream", spill_path.stat().st_size // (1024 * 1024))
+
+                    if spill_path is not None:
+                        # Стримим spill в data_handle по кускам (spill бывает только внутри COPY)
+                        if not inside_copy or data_handle is None:
+                            logger.warning("Spill file present but not inside COPY; reading into memory (may OOM)")
+                            with open(spill_path, "r", encoding="utf-8", newline="") as sf:
+                                spill_content = sf.read()
+                            lines, carry_over = split_lines_from_block(spill_content, decoded)
+                        else:
+                            with open(spill_path, "r", encoding="utf-8", newline="") as sf:
+                                while True:
+                                    chunk = sf.read(STREAM_CHUNK)
+                                    if not chunk:
+                                        break
+                                    data_handle.write(chunk)
+                                    current_data_bytes += len(chunk.encode("utf-8"))
+                            first_nl = decoded.find("\n")
+                            if first_nl != -1:
+                                line_to_write = decoded[: first_nl + 1].replace("\r\n", "\n").rstrip("\r\n") + OUTPUT_LINE_TERMINATOR
+                                data_handle.write(line_to_write)
+                                current_data_rows += 1
+                                current_data_bytes += len(line_to_write.encode("utf-8"))
+                                rest = decoded[first_nl + 1 :]
+                                lines, carry_over = split_lines_from_block("", rest)
+                            else:
+                                data_handle.write(decoded)
+                                current_data_bytes += len(decoded.encode("utf-8"))
+                                lines, carry_over = [], decoded
+                            if current_data_bytes >= MAX_DATA_CHUNK_BYTES:
+                                close_data_part_and_write_meta()
+                                current_part += 1
+                                open_data_part(
+                                    current_schema,
+                                    current_table,
+                                    current_part,
+                                    write_header=True,
+                                    copy_header_line=f"COPY {current_schema}.{current_table} ({','.join(current_columns)}) FROM stdin;\n",
+                                )
+                        try:
+                            spill_path.unlink()
+                        except OSError:
+                            pass
+                        spill_path = None
+                    else:
+                        lines, carry_over = split_lines_from_block(carry_over, decoded)
 
                 for line in lines:
                     norm = _normalize_line(line)
@@ -580,6 +641,7 @@ def run() -> None:
                     "carry_over": carry_over,
                     "current_phase": phase,
                     "inside_copy": inside_copy,
+                    "inside_junk_line": inside_junk_line,
                     "current_schema": current_schema,
                     "current_table": current_table,
                     "current_part": current_part,
@@ -609,6 +671,7 @@ def run() -> None:
                 "carry_over": carry_over,
                 "current_phase": phase,
                 "inside_copy": False,
+                "inside_junk_line": False,
                 "current_schema": current_schema,
                 "current_table": current_table,
                 "current_part": current_part,

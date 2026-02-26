@@ -25,6 +25,11 @@ CARRY_OVER_SIDE_FILENAME = "state_carry_over.bin"  # большой carry_over �
 MAX_CARRY_OVER_IN_STATE_JSON = 512 * 1024  # 512 KB; иначе state.json раздувается до гигабайт (одна длинная строка COPY)
 MAX_CARRY_OVER_MEMORY = 128 * 1024 * 1024  # 128 MB; при большем carry_over сбрасываем на диск и стримим в data_handle, иначе OOM на длинных строках
 MAX_STATE_JSON_BYTES = 100 * 1024 * 1024  # 100 MB; больший state.json не грузим (старая запись без side file), чтобы не OOM
+
+# Junk line (long runs of nulls/spaces): не накапливать в памяти, пропускать до \n и писать одну строку из \N
+JUNK_LINE_THRESHOLD_BYTES = 1 * 1024 * 1024  # 1 MB; при большей длине текущей строки проверяем на «мусор»
+JUNK_LINE_SAMPLE_BYTES = 65536  # проверяем первые 64 KB строки на долю «не мусора»
+JUNK_LINE_MAX_NON_JUNK_RATIO = 0.01  # если доля значимых символов < 1%, считаем строку мусорной
 RESTORE_STATE_FILENAME = "restore_state.json"
 SPLIT_LOG_FILENAME = "split_dump.log"
 VALIDATE_REPAIR_LOG_FILENAME = "validate_repair.log"
