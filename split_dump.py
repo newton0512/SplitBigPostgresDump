@@ -369,6 +369,12 @@ def run() -> None:
             while True:
                 block = f.read(READ_BLOCK_BYTES)
                 if not block:
+                    # EOF: если в junk-режиме — мусорная строка без \n в конце файла, пишем замену
+                    if inside_junk_line and data_handle is not None and current_columns:
+                        replacement = "\t".join(["\\N"] * len(current_columns)) + OUTPUT_LINE_TERMINATOR
+                        data_handle.write(replacement)
+                        current_data_rows += 1
+                        logger.info("EOF while in junk line: wrote replacement row")
                     break
                 try:
                     decoded = block.decode("utf-8", errors="replace")
