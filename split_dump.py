@@ -412,6 +412,16 @@ def run() -> None:
                             data_handle.write(decoded)
                             current_data_bytes += len(decoded.encode("utf-8"))
                             lines, carry_over = [], decoded
+                        if current_data_bytes >= MAX_DATA_CHUNK_BYTES:
+                            close_data_part_and_write_meta()
+                            current_part += 1
+                            open_data_part(
+                                current_schema,
+                                current_table,
+                                current_part,
+                                write_header=True,
+                                copy_header_line=f"COPY {current_schema}.{current_table} ({','.join(current_columns)}) FROM stdin;\n",
+                            )
                     try:
                         spill_path.unlink()
                     except OSError:
@@ -471,34 +481,44 @@ def run() -> None:
                         inside_copy = True
                         continue
 
-                    # Post-data: CREATE INDEX / FUNCTION / VIEW / TRIGGER / RULE (только после секции data, иначе строки из CREATE TABLE могут ложно сработать)
-                    if phase != "schema":
-                        if CREATE_INDEX_RE.match(norm):
-                            if phase != "post_data":
-                                phase = "post_data"
-                                if indexes_handle is None:
-                                    open_indexes()
-                            if indexes_handle is not None:
-                                indexes_handle.write(line_to_write)
-                            continue
-                        if CREATE_FUNCTION_RE.match(norm):
-                            if phase != "post_data":
-                                phase = "post_data"
-                            if functions_handle is None:
-                                open_functions()
-                            if functions_handle is not None:
-                                functions_handle.write(line_to_write)
-                            continue
-                        if CREATE_VIEW_RE.match(norm) or CREATE_TRIGGER_RE.match(norm) or CREATE_RULE_RE.match(norm):
-                            if phase != "post_data":
-                                phase = "post_data"
+                    # Post-data: CREATE INDEX / FUNCTION / VIEW / TRIGGER / RULE
+                    # Проверяем при любой фазе: в части дампов эти объекты идут после CREATE TABLE (schema), нужно перейти в post_data и писать в 04/05/06
+                    if CREATE_INDEX_RE.match(norm):
+                        if phase == "schema" and schema_handle is not None:
+                            schema_handle.close()
+                            schema_handle = None
+                        if phase != "post_data":
+                            phase = "post_data"
+                            if indexes_handle is None:
+                                open_indexes()
+                        if indexes_handle is not None:
+                            indexes_handle.write(line_to_write)
+                        continue
+                    if CREATE_FUNCTION_RE.match(norm):
+                        if phase == "schema" and schema_handle is not None:
+                            schema_handle.close()
+                            schema_handle = None
+                        if phase != "post_data":
+                            phase = "post_data"
+                        if functions_handle is None:
+                            open_functions()
+                        if functions_handle is not None:
+                            functions_handle.write(line_to_write)
+                        continue
+                    if CREATE_VIEW_RE.match(norm) or CREATE_TRIGGER_RE.match(norm) or CREATE_RULE_RE.match(norm):
+                        if phase == "schema" and schema_handle is not None:
+                            schema_handle.close()
+                            schema_handle = None
+                        if phase != "post_data":
+                            phase = "post_data"
                             if views_triggers_handle is None:
                                 open_views_triggers()
-                            if views_triggers_handle is not None:
-                                views_triggers_handle.write(line_to_write)
-                            continue
+                        if views_triggers_handle is not None:
+                            views_triggers_handle.write(line_to_write)
+                        continue
 
                     # CREATE TABLE — каждый в свой 02_schema_<schema>_<table>.sql с полным определением
+                    # В некоторых дампах CREATE TABLE идёт после секции данных; тогда phase уже "data" — всё равно переходим в schema и пишем 02_*
                     create_table_match = CREATE_TABLE_RE.match(norm)
                     if create_table_match:
                         ref = create_table_match.group(1).strip()
@@ -508,8 +528,9 @@ def run() -> None:
                                 preamble_handle.close()
                                 preamble_handle = None
                             phase = "schema"
-                        if phase == "schema":
-                            schema_handle = open_schema(schema, table)  # явно присваиваем новый handle
+                        elif phase != "schema":
+                            phase = "schema"
+                        schema_handle = open_schema(schema, table)
                         if schema_handle is not None:
                             schema_handle.write(line_to_write)
                         continue
@@ -519,8 +540,11 @@ def run() -> None:
                         schema_handle.write(line_to_write)
                         continue
 
-                    # SELECT pg_catalog.pg_... (sequence setval etc.) - только не в schema
-                    if phase != "schema" and SELECT_PG_RE.match(norm):
+                    # SELECT pg_catalog.pg_... (sequence setval etc.)
+                    if SELECT_PG_RE.match(norm):
+                        if phase == "schema" and schema_handle is not None:
+                            schema_handle.close()
+                            schema_handle = None
                         if phase != "post_data":
                             phase = "post_data"
                             if views_triggers_handle is None:
