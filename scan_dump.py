@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Scan a large PostgreSQL plain SQL dump in one pass (same block-by-block reading as split_dump).
-Collects: list of tables, indexes, functions, and tables with data (row counts).
-Outputs JSON report and a short summary to stdout.
+Scan a large PostgreSQL plain SQL dump in one pass (block-by-block).
+Searches for markers (CREATE TABLE, COPY ... FROM stdin, CREATE INDEX, CREATE FUNCTION)
+in full lines only; collects tables, indexes, functions, and tables that have data (no row counts).
+Uses a bounded overlap between blocks so markers split at boundaries are still found.
 """
 from __future__ import annotations
 
@@ -21,12 +22,12 @@ from split_dump import (
     CREATE_TABLE_RE,
     _normalize_line,
     _parse_table_ref,
-    split_lines_from_block,
 )
 
 SCAN_LOG_FILENAME = "scan_dump.log"
 SCAN_RESULT_FILENAME = "scan_result.json"
 LOG_PROGRESS_MB = 512
+MAX_OVERLAP_BYTES = 256 * 1024  # 256 KB tail between blocks
 
 
 def setup_logging(out_dir: Path) -> logging.Logger:
@@ -46,28 +47,74 @@ def setup_logging(out_dir: Path) -> logging.Logger:
     return logger
 
 
+def _apply_markers(
+    line: str,
+    tables_seen: set[tuple[str, str]],
+    tables: list[dict[str, str]],
+    tables_with_data_seen: set[tuple[str, str]],
+    tables_with_data: list[dict[str, str]],
+    indexes_seen: set[str],
+    indexes: list[str],
+    functions_seen: set[str],
+    functions: list[str],
+) -> None:
+    """Check line against markers and update collections (with dedup)."""
+    norm = _normalize_line(line)
+
+    copy_match = COPY_FROM_STDIN_RE.match(norm)
+    if copy_match:
+        table_ref = copy_match.group(1).strip()
+        schema, table = _parse_table_ref(table_ref)
+        key = (schema, table)
+        if key not in tables_with_data_seen:
+            tables_with_data_seen.add(key)
+            tables_with_data.append({"schema": schema, "table": table})
+        return
+
+    create_table_match = CREATE_TABLE_RE.match(norm)
+    if create_table_match:
+        ref = create_table_match.group(1).strip()
+        schema, table = _parse_table_ref(ref)
+        key = (schema, table)
+        if key not in tables_seen:
+            tables_seen.add(key)
+            tables.append({"schema": schema, "table": table})
+        return
+
+    if CREATE_INDEX_RE.match(norm):
+        if norm not in indexes_seen:
+            indexes_seen.add(norm)
+            indexes.append(norm)
+        return
+
+    if CREATE_FUNCTION_RE.match(norm):
+        if norm not in functions_seen:
+            functions_seen.add(norm)
+            functions.append(norm)
+        return
+
+
 def run(
     input_path: Path,
     output_path: Path,
     block_bytes: int,
+    out_dir: Path,
     logger: logging.Logger,
 ) -> None:
     tables_seen: set[tuple[str, str]] = set()
     tables: list[dict[str, str]] = []
+    tables_with_data_seen: set[tuple[str, str]] = set()
+    tables_with_data: list[dict[str, str]] = []
+    indexes_seen: set[str] = set()
     indexes: list[str] = []
+    functions_seen: set[str] = set()
     functions: list[str] = []
-    tables_with_data: list[dict[str, str | int]] = []
-
-    inside_copy = False
-    current_schema = ""
-    current_table = ""
-    current_rows = 0
 
     bytes_processed = 0
     last_log_mb = 0
+    overlap = ""
 
     with open(input_path, "rb") as f:
-        carry_over = ""
         while True:
             block = f.read(block_bytes)
             if not block:
@@ -83,46 +130,35 @@ def run(
                 last_log_mb = bytes_processed // (1024 * 1024)
                 logger.info("Processed %s MB", last_log_mb)
 
-            lines, carry_over = split_lines_from_block(carry_over, decoded)
+            buffer = overlap + decoded
+            last_nl = buffer.rfind("\n")
 
-            for line in lines:
-                norm = _normalize_line(line)
+            if last_nl == -1:
+                overlap = buffer[-MAX_OVERLAP_BYTES:] if len(buffer) > MAX_OVERLAP_BYTES else buffer
+                continue
 
-                if inside_copy:
-                    if norm == "\\.":
-                        tables_with_data.append(
-                            {"schema": current_schema, "table": current_table, "rows": current_rows}
-                        )
-                        inside_copy = False
-                        continue
-                    current_rows += 1
+            complete = buffer[: last_nl + 1]
+            new_overlap = buffer[last_nl + 1 :]
+            if len(new_overlap) > MAX_OVERLAP_BYTES:
+                new_overlap = new_overlap[-MAX_OVERLAP_BYTES:]
+            overlap = new_overlap
+
+            normalized_complete = complete.replace("\r\n", "\n")
+            for line in normalized_complete.split("\n"):
+                line = line.strip()
+                if not line:
                     continue
-
-                copy_match = COPY_FROM_STDIN_RE.match(norm)
-                if copy_match:
-                    table_ref = copy_match.group(1).strip()
-                    current_schema, current_table = _parse_table_ref(table_ref)
-                    current_rows = 0
-                    inside_copy = True
-                    continue
-
-                create_table_match = CREATE_TABLE_RE.match(norm)
-                if create_table_match:
-                    ref = create_table_match.group(1).strip()
-                    schema, table = _parse_table_ref(ref)
-                    key = (schema, table)
-                    if key not in tables_seen:
-                        tables_seen.add(key)
-                        tables.append({"schema": schema, "table": table})
-                    continue
-
-                if CREATE_INDEX_RE.match(norm):
-                    indexes.append(norm)
-                    continue
-
-                if CREATE_FUNCTION_RE.match(norm):
-                    functions.append(norm)
-                    continue
+                _apply_markers(
+                    line,
+                    tables_seen,
+                    tables,
+                    tables_with_data_seen,
+                    tables_with_data,
+                    indexes_seen,
+                    indexes,
+                    functions_seen,
+                    functions,
+                )
 
     result = {
         "tables": tables,
@@ -135,19 +171,19 @@ def run(
     with open(output_path, "w", encoding="utf-8") as out:
         json.dump(result, out, indent=2, ensure_ascii=False)
 
-    total_data_rows = sum(t["rows"] for t in tables_with_data)
     logger.info("Scan complete. Processed %s bytes.", bytes_processed)
     print("--- Summary ---")
     print("Tables (CREATE TABLE):", len(tables))
     print("Indexes (CREATE INDEX):", len(indexes))
     print("Functions (CREATE FUNCTION/PROCEDURE):", len(functions))
-    print("Tables with data (COPY):", len(tables_with_data))
-    print("Total data rows:", total_data_rows)
+    print("Tables with data (COPY):", len(tables_with_data), "(counts not computed)")
     print("Result written to:", output_path)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Scan PostgreSQL dump and collect tables, indexes, functions, and data row counts.")
+    parser = argparse.ArgumentParser(
+        description="Scan PostgreSQL dump for tables, indexes, functions, and tables with COPY data (marker-based, no row counts)."
+    )
     parser.add_argument(
         "--output",
         "-o",
@@ -186,7 +222,7 @@ def main() -> None:
         logger.error("Input dump not found: %s", input_path)
         sys.exit(1)
 
-    run(input_path, output_path, READ_BLOCK_BYTES, logger)
+    run(input_path, output_path, READ_BLOCK_BYTES, out_dir_for_log, logger)
 
 
 if __name__ == "__main__":
