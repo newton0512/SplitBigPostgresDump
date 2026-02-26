@@ -401,6 +401,25 @@ def run() -> None:
                                     "Junk line detected (~%s MB), skipping until newline",
                                     current_line_len // (1024 * 1024),
                                 )
+                    # Строка длинная, но начало «нормальное» — перед spill проверяем хвост (нули в конце поля)
+                    if not inside_junk_line and current_line_len >= MAX_CARRY_OVER_MEMORY:
+                        sample_tail = carry_over[-JUNK_LINE_SAMPLE_BYTES:]
+                        if sample_tail:
+                            non_junk_tail = (
+                                len(sample_tail)
+                                - sample_tail.count("\x00")
+                                - sample_tail.count(" ")
+                                - sample_tail.count("\t")
+                                - sample_tail.count("\n")
+                                - sample_tail.count("\r")
+                            )
+                            if non_junk_tail < JUNK_LINE_MAX_NON_JUNK_RATIO * len(sample_tail):
+                                inside_junk_line = True
+                                junk_line_start_in_buffer = 0
+                                logger.info(
+                                    "Junk line (tail) detected (~%s MB), skipping until newline",
+                                    current_line_len // (1024 * 1024),
+                                )
 
                 if inside_copy and inside_junk_line:
                     did_junk_handling = True
